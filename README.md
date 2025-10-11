@@ -211,7 +211,7 @@ python ScreenTranslate.py
 | `OST_HIDE_ON_CAPTURE` | `1` | 1でキャプチャ瞬間にUIを隠す |
 | `OST_SAVE_CAPTURE` | `0` | 1で送信実画像（used\_main\_*.png 等）も保存 |
 | `OST_CONCAT_MAX` | `10` | 連結の最大枚数 |
-| `OST_PREPROCESS` | `0` | 保存した画像をカラーにするかどうかの設定(1でカラー) | 
+| `OST_PREPROCESS` | `0` | 保存した画像をカラーにするかどうかの設定(0でカラー) | 
 | `OST_CONCAT_MODE_L` | `L` | 連結時に保存した画像をカラーにするかどうかの設定(RGBでカラー) | 
 | `OST_GUI_HOTKEYS` | `0` | GUIモード時に一部制限したキー操作を有効にするかどうかの設定(1で有効) | 
 | `OST_EXIT_HOTKEY` | `ctrl+shift+f12` | 終了ホットキー |
