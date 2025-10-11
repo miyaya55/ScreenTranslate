@@ -1,31 +1,4 @@
 
-## 簡易導入手順(D配下前提)
-CMD (コマンドプロンプト)** の例:
-cmd (管理者権限での起動が安牌)
-cd /d D:\ScreenTranslate
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-setx GEMINI_API_KEY 使用するAPIキー(例 setx GEMINI_API_KEY Azterststexxxxx)
-
-## 簡易起動方法(D:配下にフォルダ置く前提)
-cmd (管理者権限での起動が安牌
-cd /d D:\ScreenTranslate
-.venv\Scripts\activate
-set GEMINI_MODEL=gemini-2.5-flash
-set OST_SAVE_CAPTURE=1
-set OST_DEBUG=1
-set OST_GUI_MODE=1(任意。コマンドの代わりにGUIで動くようになる)
-set OST_PREPROCESS=0(任意。カラーで画像が設定される)
-set OST_GUI_HOTKEYS=1(任意。GUIモードでも一部のキーが有効になる)
-set OST_SAVE_ANNOTATED=1(任意。訳文を併記した画像を生成する)
-python ScreenTranslate.py
-
-# ScreenTranslate (On-Screen Game Translator)
-
-> 画面の任意範囲を選択 → OCR → **日本語へ翻訳** → その場に表示。  
-> 連結キャプチャ、GUI操作、**口調プリセット**（即反映）、原文保持/コピー、
-> **画像への併記保存**（下/右）、**キャンセル**、**外観とパネルを環境変数で柔軟カスタム**。
 
 ---
 
@@ -78,11 +51,9 @@ python ScreenTranslate.py
 
 ## インストール
 ```bash
-# 仮想環境は任意
+### コマンドプロンプト
 python -m venv .venv
-# Windows
 .venv\Scripts\activate
-
 pip install -r requirements.txt
 ```
 
@@ -92,24 +63,19 @@ pip install -r requirements.txt
 - `GEMINI_API_KEY` **または** `GOOGLE_API_KEY`（どちらでも可。事前にGoogle AI StudioでAPIキー（無料枠お勧め）を払い出すこと）
 - `setx GEMINI API_KEY AIxxxxxxxxx
 
-Windows (PowerShell):
-```powershell
-$env:GEMINI_API_KEY = 'xxxxxxxxxxxxxxxx'
-$env:GEMINI_MODEL   = 'gemini-2.5-flash'
-```
-
----
-
 ## 起動方法
-### 標準（オーバーレイ）
-```bash
-python ScreenTranslate.py
+### コマンドプロンプト
 ```
-
-### GUIパネルあり
-```powershell
-$env:OST_GUI_MODE = '1'
-python .\ScreenTranslate.py
+cd /d D:\ScreenTranslate
+.venv\Scripts\activate
+set GEMINI_MODEL=gemini-2.5-flash
+set OST_SAVE_CAPTURE=1
+set OST_DEBUG=1
+set OST_GUI_MODE=1(任意。コマンドの代わりにGUIで動くようになる)
+set OST_PREPROCESS=0(任意。カラーで画像が設定される)
+set OST_GUI_HOTKEYS=1(任意。GUIモードでも一部のキーが有効になる)
+set OST_SAVE_ANNOTATED=1(任意。訳文を併記した画像を生成する)
+python ScreenTranslate.py
 ```
 
 > **cmd.exe** は `set NAME=VALUE`（`=`の前後にスペースを入れない）。
@@ -121,6 +87,7 @@ python .\ScreenTranslate.py
 2. 必要なら**話者枠**（Alt+S）を黄枠で指定  
 3. **翻訳**（Alt+T） → 訳文が内側/外置きに表示  
 4. 右クリックで **コピー**／**画像として保存**（訳のみ / 原文＋訳文）
+5. 色々下に説明がありますが、簡単な動かし方は操作手順.xlsxに書いてます。
 
 ---
 
@@ -130,7 +97,6 @@ python .\ScreenTranslate.py
 |---|---|
 | 翻訳 | **Alt+T** |
 | 範囲選択 | **Alt+C** |
-| Reader 表示 | **Alt+R** |
 | 口調ダイアログ | **Alt+K** |
 | 話者ダイアログ | **Alt+F** |
 | 話者枠の選択 | **Alt+S** |
