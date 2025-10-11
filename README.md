@@ -113,7 +113,7 @@ python ScreenTranslate.py
 | 青枠/黄枠 編集モード | **F10 / F11** |
 | 訳文欄 表示/非表示 | **Alt+Z** |
 | **キャンセル** | **Alt+X** |
-| **終了** | 既定 **Ctrl+Shift+F12**（`OST_EXIT_HOTKEY` で変更可） |
+| **終了** | 既定 **Ctrl+Shift+F12(F12だけでも終了します)** |
 
 ---
 
@@ -178,7 +178,7 @@ python ScreenTranslate.py
 ### 併記PNGの体裁
 | 変数 | 既定 | 説明 |
 |---|---|---|
-| `OST_SAVE_ANNOTATED` | `0` | 1で翻訳成功時に自動保存 |
+| `OST_SAVE_ANNOTATED` | `0` | 1で翻訳成功時に訳文を併記した画像をcapturesに自動保存 |
 | `OST_ANN_INCLUDE_SRC` | `0` | 1で原文も併記 |
 | `OST_ANN_LAYOUT` | `auto` | `auto`/`side`/`bottom` |
 | `OST_ANN_SIDE_THRESHOLD` | `1.6` | **高さ/幅 ≥ 値** で横併記 |
@@ -210,6 +210,9 @@ python ScreenTranslate.py
 | `OST_HIDE_ON_CAPTURE` | `1` | 1でキャプチャ瞬間にUIを隠す |
 | `OST_SAVE_CAPTURE` | `0` | 1で送信実画像（used\_main\_*.png 等）も保存 |
 | `OST_CONCAT_MAX` | `10` | 連結の最大枚数 |
+| `OST_PREPROCESS` | `0` | 保存した画像をカラーにするかどうかの設定(1でカラー) | 
+| `OST_CONCAT_MODE_L` | `L` | 連結時に保存した画像をカラーにするかどうかの設定(RGBでカラー) | 
+| `OST_GUI_HOTKEYS` | `0` | GUIモード時に一部制限したキー操作を有効にするかどうかの設定(1で有効) | 
 | `OST_EXIT_HOTKEY` | `ctrl+shift+f12` | 終了ホットキー |
 
 ---
