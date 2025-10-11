@@ -72,10 +72,8 @@ python ScreenTranslate.py
 
 ## 動作環境
 - **OS**：Windows 10/11 推奨（グローバルホットキーの互換性）  
-  macOS / Linux でも動作可（`keyboard` のグローバルフックは制限される場合あり）
-- **Python**：3.9+ 推奨
+- **Python**：3.10 以上推奨
 - **依存**：`requirements.txt`（`PySide6`, `Pillow`, `mss`, `keyboard`, `requests`）
-
 ---
 
 ## インストール
@@ -92,9 +90,9 @@ pip install -r requirements.txt
 
 ---
 
-## APIキー/モデルの設定
-- `GEMINI_API_KEY` **または** `GOOGLE_API_KEY`（どちらでも可）
-- `GEMINI_MODEL`（任意、既定は `gemini-2.5-flash` など）
+## APIキーの設定
+- `GEMINI_API_KEY` **または** `GOOGLE_API_KEY`（どちらでも可。事前にGoogle AI StudioでAPIキー（無料枠お勧め）を払い出すこと）
+- `setx GEMINI API_KEY AIxxxxxxxxx
 
 Windows (PowerShell):
 ```powershell
