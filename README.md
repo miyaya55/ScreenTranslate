@@ -24,7 +24,7 @@ python ScreenTranslate.py
 # ScreenTranslate (On-Screen Game Translator)
 
 > 画面の任意範囲を選択 → OCR → **日本語へ翻訳** → その場に表示。  
-> 連結キャプチャ、GUI操作、**ホットキーのGUIリマップ**、**口調プリセット**（即反映）、原文保持/コピー、
+> 連結キャプチャ、GUI操作、**口調プリセット**（即反映）、原文保持/コピー、
 > **画像への併記保存**（下/右）、**キャンセル**、**外観とパネルを環境変数で柔軟カスタム**。
 
 ---
@@ -61,7 +61,7 @@ python ScreenTranslate.py
 ## 特徴
 - 🖼 **ドラッグ選択 → 即翻訳**：画面の任意範囲をOCR → 日本語訳をオーバーレイ表示
 - ➕ **連結キャプチャ**：複数枚を**縦連結**し一括翻訳（UIや長文に便利）
-- 🧰 **GUIパネル**：ボタン操作、**ホットキーのGUIリマップ**、**口調プリセット**
+- 🧰 **GUIパネル**：ボタン操作、**口調プリセット**
 - 🗣 **話者（黄枠）指定**：会話相手の枠を黄枠で指定、口調/話者名も指定
 - 📋 **原文保持 & 右クリックコピー**：`{"source","ja"}`で受け取り、訳欄は**jaのみ**表示
 - 🖼 **画像として保存**：訳文（＋原文）を**下側**または**右側**に併記したPNGを保存（手動/自動）
@@ -82,8 +82,6 @@ python ScreenTranslate.py
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
@@ -151,16 +149,9 @@ python .\ScreenTranslate.py
 | **キャンセル** | **Alt+X** |
 | **終了** | 既定 **Ctrl+Shift+F12**（`OST_EXIT_HOTKEY` で変更可） |
 
-> **GUIリマップ**：GUIパネルの「**キー設定…**」から自由に割当て、`ost_hotkeys.json` に保存。  
-> GUI中でもホットキーを有効化する設定も可能。
-
 ---
 
 ## GUIパネル
-
-### キー設定（GUIリマップ）
-- 「キー設定…」で各機能にショートカットを割当て → **保存** で即反映  
-- 設定は `ost_hotkeys.json` に保存（次回も有効）
 
 ### 口調プリセット（即反映）
 - 上部プルダウンの選択 **＝即本文に反映**  
@@ -314,7 +305,6 @@ python .\ScreenTranslate.py
 - `ScreenTranslate.py` … メイン（最新）
 - `requirements.txt` … 依存
 - `captures/` … 各種保存物（キャプチャ/併記画像/履歴）
-- `ost_hotkeys.json` … キー設定（GUIで保存）
 - `ost_tone_presets.json` … 口調プリセット
 
 ---
