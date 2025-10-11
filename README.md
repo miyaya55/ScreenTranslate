@@ -279,5 +279,3 @@ python .\ScreenTranslate.py
 
 ---
 
-## ライセンス
-プロジェクト方針に合わせて選択してください（例：MIT）。
