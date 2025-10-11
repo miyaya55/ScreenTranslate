@@ -1,14 +1,15 @@
-## 簡易導入手順(D配下前庭)
-**CMD (コマンドプロンプト)** の例:
-`cmd`(管理者権限での起動が安牌)
+
+## 簡易導入手順(D配下前提)
+CMD (コマンドプロンプト)** の例:
+cmd (管理者権限での起動が安牌)
 cd /d D:\ScreenTranslate
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 setx GEMINI_API_KEY 使用するAPIキー(例 setx GEMINI_API_KEY Azterststexxxxx)
 
-簡易起動方法(D:配下にフォルダ置く前提)
-cmd`(管理者権限での起動が安牌
+## 簡易起動方法(D:配下にフォルダ置く前提)
+cmd (管理者権限での起動が安牌
 cd /d D:\ScreenTranslate
 .venv\Scripts\activate
 set GEMINI_MODEL=gemini-2.5-flash
@@ -19,7 +20,6 @@ set OST_PREPROCESS=0(任意。カラーで画像が設定される)
 set OST_GUI_HOTKEYS=1(任意。GUIモードでも一部のキーが有効になる)
 set OST_SAVE_ANNOTATED=1(任意。訳文を併記した画像を生成する)
 python ScreenTranslate.py
-
 
 # ScreenTranslate (On-Screen Game Translator)
 
@@ -66,7 +66,6 @@ python ScreenTranslate.py
 - 📋 **原文保持 & 右クリックコピー**：`{"source","ja"}`で受け取り、訳欄は**jaのみ**表示
 - 🖼 **画像として保存**：訳文（＋原文）を**下側**または**右側**に併記したPNGを保存（手動/自動）
 - ⏹ **キャンセル**：API中でも**Alt+X**で即キャンセル → 「（キャンセルしました）」を表示
-- 🧱 **堅牢なJSON抽出**：```json フェンスや前後のゴミ混入でも `source/ja` を抽出
 - 🎨 **外観カスタム**：枠色/太さ/角丸/余白、パネル配色、併記PNGの体裁、**パネル横幅/ボタン幅/高さ**を環境変数で変更
 
 ---
