@@ -75,6 +75,7 @@ set OST_GUI_MODE=1(任意。コマンドの代わりにGUIで動くようにな�
 set OST_PREPROCESS=0(任意。カラーで画像が設定される)
 set OST_GUI_HOTKEYS=1(任意。GUIモードでも一部のキーが有効になる)
 set OST_SAVE_ANNOTATED=1(任意。訳文を併記した画像を生成する)
+set OST_PRIMARY_ONLY=0(マルチディスプレイ環境の場合は1に設定しないと動かない)
 python ScreenTranslate.py
 ```
 
