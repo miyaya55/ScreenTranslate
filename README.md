@@ -61,7 +61,7 @@ pip install -r requirements.txt
 
 ## APIキーの設定
 - `GEMINI_API_KEY` **または** `GOOGLE_API_KEY`（どちらでも可。事前にGoogle AI StudioでAPIキー（無料枠お勧め）を払い出すこと）
-- `setx GEMINI API_KEY AIxxxxxxxxx
+- `setx GEMINI_API_KEY AIxxxxxxxxx
 
 ## 起動方法
 ### コマンドプロンプト
