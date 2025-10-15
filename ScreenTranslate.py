@@ -14,14 +14,14 @@ from dataclasses import dataclass
 import base64, io, os, sys, threading, time, json, re
 from typing import Optional, Dict, List
 import requests
-from PIL import Image, ImageEnhance, ImageDraw, ImageFont
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageFilter
 
-from PySide6.QtCore import Qt, QRect, QTimer, QPoint, QCoreApplication, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QRect, QTimer, QPoint, QCoreApplication, QThread, Signal, Slot, QSize
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QGuiApplication, QCursor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QWidget, QTextEdit, QDialog, QVBoxLayout, QLabel, QDialogButtonBox, QLineEdit,
     QPushButton, QGridLayout, QHBoxLayout, QCheckBox, QMenu, QKeySequenceEdit,
-    QComboBox, QInputDialog, QMessageBox, QSizePolicy  # ← 追加
+    QComboBox, QInputDialog, QMessageBox, QSizePolicy, QFileDialog, QListWidget, QListWidgetItem, QListView, QAbstractItemView, QSpacerItem  # ← 追加
 )
 
 import mss, keyboard
@@ -116,6 +116,11 @@ OST_GUI_BTN_H = int(os.environ.get("OST_GUI_BTN_H", "28"))
 OST_GUI_SPACING = int(os.environ.get("OST_GUI_SPACING", "6"))
 def _parse_margins(s, default=(6,6,6,6)):
     try:
+        if not isinstance(s, str):
+            try:
+                s = str(s)
+            except Exception:
+                s = ""
         parts = [int(x) for x in re.split(r"[ ,]+", s.strip()) if x]
         if len(parts) == 4:
             return tuple(parts)
@@ -131,6 +136,12 @@ OST_SAVE_ANNOTATED = os.environ.get("OST_SAVE_ANNOTATED", "0") == "1"
 OST_ANN_INCLUDE_SRC = os.environ.get("OST_ANN_INCLUDE_SRC", "0") == "1"
 # 原文も保持してコピーできるよう、JSON出力を使うフラグ（既定ON）
 KEEP_SOURCE = os.environ.get("OST_KEEP_SOURCE", "1") == "1"
+# 有名テキストでRECITATIONが出たら自動で『訳文のみ』に落とす（1=有効）
+OST_RECITATION_AUTO = os.environ.get("OST_RECITATION_AUTO", "1") == "1"
+OST_SLICE_ON_RECITATION = os.environ.get("OST_SLICE_ON_RECITATION", "1") == "1"
+OST_SLICE_PARTS = max(2, int(os.environ.get("OST_SLICE_PARTS", "3")))
+# JA-only再試行を行うか (0: 行わず直接スライス, 1: 行う)。既定は 0
+OST_RECITATION_JA_RETRY = os.environ.get("OST_RECITATION_JA_RETRY", "0") == "1"
 
 DEFAULT_TEXT_RATIO = float(os.environ.get("OST_TEXT_RATIO", "0.28"))
 DEFAULT_FONT_PT = int(os.environ.get("OST_FONT_PT", "12"))
@@ -178,6 +189,37 @@ AUTO_EDIT           = os.environ.get("OST_ROI_AUTO_EDIT", "1") == "1"
 AUTO_EDIT_MOVE      = os.environ.get("OST_ROI_AUTO_MOVE", "0") == "1"  # 内部ドラッグ移動（既定OFF）
 BORDER_MOVE_ENABLE  = os.environ.get("OST_ROI_BORDER_MOVE", "1") == "1"  # 縁での移動（既定ON）
 MOVE_BAND           = int(os.environ.get("OST_MOVE_BAND", "8"))  # 縁の幅(px)
+
+
+# --- Tone preset switching (Lite/Pro) ---
+OST_TONE_PRESET_MODE = os.environ.get("OST_TONE_PRESET_MODE", "lite").strip().lower()
+def _tone_preset_file_for_mode(mode: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    return os.path.join(base_dir, "ost_tone_presets_v2.json" if (mode or "").strip().lower()=="pro" else "ost_tone_presets.json")
+
+# --- Game-specific preset packs ---
+TONE_GAMES_DIR = os.environ.get("OST_TONE_GAMES_DIR", os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "tone_games"))
+def _discover_tone_games() -> list:
+    try:
+        d = TONE_GAMES_DIR
+        if not os.path.isdir(d): return []
+        names = []
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if not os.path.isdir(p): continue
+            lite = os.path.join(p, "ost_tone_presets.json")
+            pro  = os.path.join(p, "ost_tone_presets_v2.json")
+            if os.path.exists(lite) or os.path.exists(pro):
+                names.append(name)
+        return names
+    except Exception:
+        return []
+
+def _tone_preset_file_for_scope(mode: str, scope: str, game: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    if (scope or "").strip().lower()=="game" and (game or "").strip():
+        return os.path.join(TONE_GAMES_DIR, game.strip(), "ost_tone_presets_v2.json" if (mode or "").strip().lower()=="pro" else "ost_tone_presets.json")
+    return _tone_preset_file_for_mode(mode)
 
 TONE_PRESET_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "ost_tone_presets.json")
 
@@ -350,6 +392,100 @@ class ScrollMessagePanel(QWidget):
 
 
 class ReaderPanel(ScrollMessagePanel):
+    
+    pass
+
+class ImagePickerDialog(QDialog):
+    """非ネイティブでサムネイル付きの複数選択ダイアログ"""
+    def __init__(self, parent=None, start_dir:str=None):
+        super().__init__(parent)
+        self.setWindowTitle("画像を選択して翻訳")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self._selected = []
+        lay = QVBoxLayout(self)
+
+        # 現在のフォルダ表示と「フォルダを開く」
+        top = QHBoxLayout()
+        self.lbl_dir = QLabel("—")
+        btn_browse = QPushButton("フォルダを開く…")
+        top.addWidget(self.lbl_dir, 1)
+        top.addWidget(btn_browse, 0)
+        lay.addLayout(top)
+
+        # サムネイル一覧
+        self.listw = QListWidget(self)
+        self.listw.setViewMode(QListView.IconMode)
+        self.listw.setIconSize(QSize(128, 128))
+        self.listw.setResizeMode(QListView.Adjust)
+        self.listw.setMovement(QListView.Static)
+        self.listw.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.listw.setSpacing(8)
+        lay.addWidget(self.listw, 1)
+
+        # ボタン
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        lay.addWidget(btns)
+
+        # signals
+        btn_browse.clicked.connect(self._choose_dir)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        self.listw.itemDoubleClicked.connect(lambda _i: self.accept())
+
+        # 初期フォルダ
+        import os
+        if start_dir and os.path.isdir(start_dir):
+            self._dir = start_dir
+        else:
+            self._dir = os.path.expanduser("~")
+        self._reload()
+
+    def _choose_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "フォルダを選択", self._dir, QFileDialog.Option.DontUseNativeDialog)
+        if d:
+            self._dir = d
+            self._reload()
+
+    def _reload(self):
+        # 画像拡張子のみを列挙し、サムネイル表示
+        import os
+        self.lbl_dir.setText(self._dir)
+        self.listw.clear()
+        exts = (".png",".jpg",".jpeg",".bmp",".webp",".gif")
+        try:
+            files = [f for f in os.listdir(self._dir) if f.lower().endswith(exts)]
+        except Exception:
+            files = []
+        try:
+            # 新しい → 古い（降順）。同一時刻の時は名前昇順で安定化
+            files = sorted(
+                files,
+                key=lambda f: (-os.path.getmtime(os.path.join(self._dir, f)), f.lower())
+            )
+        except Exception:
+            # 失敗時は名前順にフォールバック
+            files = sorted(files)
+        from PySide6.QtGui import QPixmap, QIcon
+        for f in files:
+            fp = os.path.join(self._dir, f)
+            try:
+                pm = QPixmap(fp)
+                if not pm.isNull():
+                    icon = QIcon(pm.scaled(self.listw.iconSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                else:
+                    icon = QIcon()
+            except Exception:
+                icon = QIcon()
+            it = QListWidgetItem(icon, f)
+            it.setToolTip(f)
+            it.setData(Qt.UserRole, fp)
+            self.listw.addItem(it)
+
+    def selected_files(self) -> list:
+        paths = []
+        for it in self.listw.selectedItems():
+            paths.append(it.data(Qt.UserRole))
+        return paths
     pass
 
 
@@ -400,6 +536,7 @@ class ControlPanel(QWidget):
     def __init__(self, overlay: 'Overlay'):
         super().__init__(None, Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setWindowTitle("OST 操作パネル")
+        self.setAcceptDrops(True)
         self.overlay = overlay
 
         lay = QVBoxLayout(self)
@@ -415,12 +552,19 @@ class ControlPanel(QWidget):
         self.btn_k = QPushButton("口調 (ALT+K)");        self.btn_k.clicked.connect(lambda: overlay._hk(overlay._open_tone_editor))
         self.btn_s = QPushButton("話者 (ALT+F)");        self.btn_s.clicked.connect(lambda: overlay._hk(overlay._open_speaker_editor))
         self.btn_as= QPushButton("話者枠 (Alt+S)");  self.btn_as.clicked.connect(lambda: overlay._hk(overlay._start_select_speaker_roi))
-        self.btn_ss= QPushButton("話者クリア (CTRL+Shift+S)"); self.btn_ss.clicked.connect(lambda: overlay._hk(overlay._clear_speaker))
+        self.btn_ss= QPushButton("話者クリア (CTRL+Shift+S)"); 
+        self.btn_ss.clicked.connect(lambda: overlay._hk(overlay._clear_speaker))
         g.addWidget(self.btn_k, 1, 0)
         g.addWidget(self.btn_s, 1, 1)
         g.addWidget(self.btn_as,1, 2)
-        g.addWidget(self.btn_ss,2, 0, 1, 3)
-
+        # 3段目に「話者クリア / 画像から翻訳 / 最後の保存から再翻訳」
+        self.btn_from_img = QPushButton("画像から翻訳 (Alt+O)"); 
+        self.btn_from_img.clicked.connect(lambda: overlay._hk(overlay._open_images_and_translate))
+        self.btn_retry_last = QPushButton("最後の保存から再翻訳 (Alt+Shift+R)"); 
+        self.btn_retry_last.clicked.connect(lambda: overlay._hk(overlay._retry_from_last_saved))
+        g.addWidget(self.btn_ss, 2, 0)
+        g.addWidget(self.btn_from_img, 2, 1)
+        g.addWidget(self.btn_retry_last, 2, 2)
         # Concat
         self.btn_ca = QPushButton("連結に追加 (Alt+A)"); self.btn_ca.clicked.connect(lambda: overlay._hk(overlay._concat_append))
         self.btn_cd = QPushButton("連結クリア (Alt+D)"); self.btn_cd.clicked.connect(lambda: overlay._hk(overlay._concat_clear))
@@ -489,9 +633,95 @@ class ControlPanel(QWidget):
         self.cb_main_edit.blockSignals(True); self.cb_speaker_edit.blockSignals(True)
         self.cb_main_edit.setChecked(edit_main); self.cb_speaker_edit.setChecked(edit_speaker)
         self.cb_main_edit.blockSignals(False); self.cb_speaker_edit.blockSignals(False)
+    # ---- Drag & Drop (画像ファイルをドロップで翻訳) ----
+    def dragEnterEvent(self, e):
+        try:
+            if e.mimeData().hasUrls():
+                for u in e.mimeData().urls():
+                    if str(u.toLocalFile()).lower().endswith((".png",".jpg",".jpeg",".bmp",".webp",".gif")):
+                        e.acceptProposedAction()
+                        return
+            e.ignore()
+        except Exception:
+            e.ignore()
 
+    def dropEvent(self, e):
+        try:
+            paths = []
+            for u in e.mimeData().urls():
+                fp = u.toLocalFile()
+                if str(fp).lower().endswith((".png",".jpg",".jpeg",".bmp",".webp",".gif")):
+                    paths.append(fp)
+            if paths:
+                self.overlay._hk(lambda: self.overlay._translate_from_paths(paths))
+            e.acceptProposedAction()
+        except Exception:
+            e.ignore()
 
 class Overlay(QWidget):
+    # --- 画像を縦に分割してPNG配列で返す（最終手段の回避用） ---
+    def _slice_png_vertical(self, png_bytes: bytes, parts: int = 3) -> list[bytes]:
+        try:
+            from PIL import Image
+            import io
+            im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            W, H = im.size
+            parts = max(2, int(parts))
+            slice_h = max(8, H // parts)
+            outs = []
+            top = 0
+            for i in range(parts):
+                bottom = H if i == parts-1 else min(H, top + slice_h)
+                crop = im.crop((0, top, W, bottom))
+                buf = io.BytesIO(); crop.save(buf, format="PNG"); outs.append(buf.getvalue())
+                top = bottom
+            return outs
+        except Exception:
+            return [png_bytes]
+
+    def _text_width_px(self, draw, s, font):
+        try:
+            return draw.textlength(s, font=font)
+        except Exception:
+            try:
+                l,t,r,b = draw.textbbox((0,0), s, font=font)
+                return r - l
+            except Exception:
+                return len(s) * 10
+
+    # --- API送信用にPNGを最適化（長辺を制限して再エンコード） ---
+    def _optimize_png_for_api(self, png_bytes: bytes) -> bytes:
+        try:
+            from PIL import Image
+            import io, os
+            lim = int(os.environ.get("OST_MAX_WH", "2048"))  # 長辺の上限。既定 2048px
+            if lim <= 0:
+                return png_bytes
+            im = Image.open(io.BytesIO(png_bytes))
+            w, h = im.size
+            m = max(w, h)
+            if m <= lim:
+                return png_bytes
+            scale = lim / float(m)
+            new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+            im = im.resize(new_size, Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return png_bytes
+
+    # --- ユーティリティ：パス配列を更新日時でソート（古い→新しい） ---
+    def _sort_paths_by_mtime(self, paths, reverse: bool = False):
+        try:
+            import os
+            return sorted(paths, key=lambda p: os.path.getmtime(p), reverse=reverse)
+        except Exception:
+            try:
+                return sorted(paths)
+            except Exception:
+                return list(paths)
+
     sig_apply_text = Signal(str)
     sig_set_busy   = Signal(bool)
     sig_concat_cnt = Signal(int)
@@ -502,9 +732,18 @@ class Overlay(QWidget):
     HELP_BG = HELP_BG_COLOR; HELP_FG = HELP_FG_COLOR
     HANDLE_FILL = HANDLE_FILL_COLOR; HANDLE_STROKE = HANDLE_STROKE_COLOR
     
+    
+    def _tone_preset_path(self) -> str:
+        try:
+            m = (self.tone_mode or "lite").strip().lower()
+            s = (self.tone_scope or "default").strip().lower()
+            g = (self.tone_game or "").strip()
+        except Exception:
+            m, s, g = "lite", "default", ""
+        return _tone_preset_file_for_scope(m, s, g)
     def _load_tone_presets(self) -> dict:
         try:
-            with open(TONE_PRESET_FILE, "r", encoding="utf-8") as f:
+            with open(self._tone_preset_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and data:
                 return data
@@ -512,7 +751,7 @@ class Overlay(QWidget):
             pass
         # 初回は既定を書き出して返す
         try:
-            with open(TONE_PRESET_FILE, "w", encoding="utf-8") as f:
+            with open(self._tone_preset_path(), "w", encoding="utf-8") as f:
                 json.dump(TONE_PRESETS_DEFAULT, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -520,7 +759,7 @@ class Overlay(QWidget):
 
     def _save_tone_presets(self, presets: dict):
         try:
-            with open(TONE_PRESET_FILE, "w", encoding="utf-8") as f:
+            with open(self._tone_preset_path(), "w", encoding="utf-8") as f:
                 json.dump(presets, f, ensure_ascii=False, indent=2)
         except Exception as e:
             if DEBUG: print("[OST] save tone presets failed:", e)
@@ -532,10 +771,47 @@ class Overlay(QWidget):
         """
         import re, json
 
+        # Defensive: ensure raw_text is a string to avoid regex TypeError
+        if not isinstance(raw_text, str):
+            try:
+                raw_text = str(raw_text)
+            except Exception:
+                raw_text = ""
+
         if not raw_text:
             return "", ""
 
         s = raw_text.strip()
+        # 追加: JSON抽出の強化（どこに出ても拾う）
+        try:
+            import json, re as _re2
+            # ```json ... ``` / ``` ... ``` ブロックを先に試す
+            for _m in _re2.finditer(r'```(?:json)?\s*(.*?)\s*```', s, _re2.DOTALL | _re2.IGNORECASE):
+                _blk = (_m.group(1) or "").strip()
+                if _blk:
+                    try:
+                        _obj = json.loads(_blk)
+                        _src = _obj.get("source") if isinstance(_obj, dict) else ""
+                        _ja  = _obj.get("ja")     if isinstance(_obj, dict) else ""
+                        if isinstance(_src, str) and isinstance(_ja, str):
+                            return _src, _ja
+                    except Exception:
+                        pass
+            # { ... } 断片を順に試す
+            for _m in _re2.finditer(r'\{.*?\}', s, _re2.DOTALL):
+                _frag = (_m.group(0) or "").strip()
+                if _frag:
+                    try:
+                        _obj = json.loads(_frag)
+                        _src = _obj.get("source") if isinstance(_obj, dict) else ""
+                        _ja  = _obj.get("ja")     if isinstance(_obj, dict) else ""
+                        if isinstance(_src, str) and isinstance(_ja, str):
+                            return _src, _ja
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
 
         # 1) ```json ... ``` を除去
         if s.startswith("```"):
@@ -564,7 +840,7 @@ class Overlay(QWidget):
         # 3) 正規表現で "source":"...","ja":"..." をゆるく抽出（' も許容）
         m = re.search(
             r'''source\s*:\s*(?P<q1>["'])(?P<src>.*?)(?P=q1)\s*,\s*ja\s*:\s*(?P<q2>["'])(?P<ja>.*?)(?P=q2)''',
-            re.IGNORECASE | re.DOTALL
+            s, re.IGNORECASE | re.DOTALL
         )
         if m:
             def unescape(t: str) -> str:
@@ -586,6 +862,10 @@ class Overlay(QWidget):
         self.sig_set_busy.emit(False)
         
     def __init__(self):
+        # Tone preset mode/scope
+        self.tone_mode  = OST_TONE_PRESET_MODE or "lite"
+        self.tone_scope = os.environ.get("OST_TONE_SCOPE","default").strip().lower() or "default"
+        self.tone_game  = os.environ.get("OST_TONE_GAME","").strip()
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.cancel_evt = threading.Event()
         self.active_job_id = 0  # 実行中ジョブの連番
@@ -687,6 +967,29 @@ class Overlay(QWidget):
         self._hotkeys_off = False
         self._install_hotkeys()
         if DEBUG: print("[OST] hotkeys resumed")
+    def _apply_busy_hotkeys(self, busy: bool):
+        """
+        応答中(busy=True)はキャンセル(Alt+X)以外のホットキーを無効化し、
+        終了ホットキー(EXIT_HOTKEY)は従来どおり有効にします。
+        応答終了(busy=False)で通常のホットキーを再登録します。
+        """
+        try:
+            keyboard.unhook_all(); keyboard.clear_all_hotkeys()
+        except Exception:
+            pass
+        if busy:
+            try:
+                keyboard.add_hotkey('alt+x', lambda: self._hk(self.trigger_cancel))
+                # 終了ホットキーは許可しておく
+                keyboard.add_hotkey(EXIT_HOTKEY, lambda: self._hk(self._quit))
+                if DEBUG: print("[OST] busy hotkeys: only Cancel/Exit enabled")
+            except Exception as e:
+                if DEBUG: print("[OST] busy hotkeys failed:", e)
+        else:
+            # 通常ホットキーに戻す
+            self._install_hotkeys()
+            if DEBUG: print("[OST] hotkeys restored (non-busy)")
+
 
     def _install_hotkeys(self):
         if self._hotkeys_off: return
@@ -720,6 +1023,8 @@ class Overlay(QWidget):
                 # Concat
                 keyboard.add_hotkey('alt+a', lambda: self._hk(self._concat_append))
                 keyboard.add_hotkey('alt+d', lambda: self._hk(self._concat_clear))
+            keyboard.add_hotkey('alt+o', lambda: self._hk(self._open_images_and_translate))
+            keyboard.add_hotkey('alt+shift+r', lambda: self._hk(self._retry_from_last_saved))
 
             if DEBUG: print("[OST] Hotkeys registered (keyboard)  GUI_MODE=", self.gui_mode)
         except Exception as e:
@@ -862,6 +1167,11 @@ class Overlay(QWidget):
     @Slot(bool)
     def _on_set_busy(self, b: bool):
         self.state.busy = b
+        # 応答中はキャンセル以外のホットキーを無効化
+        try:
+            self._apply_busy_hotkeys(b)
+        except Exception:
+            pass
         if b:
             self.state.dots = 0
             if self.msg_outside and self.show_msg: self.msg_panel.set_text("翻訳中")
@@ -1073,12 +1383,58 @@ class Overlay(QWidget):
             dlg.setWindowTitle("口調の設定")
             lay = QVBoxLayout(dlg)
 
+            # モード（lite/pro）
+            mode_row = QHBoxLayout()
+            mode_row.addWidget(QLabel("モード:"))
+            mode_cb = QComboBox(dlg)
+            mode_cb.addItems(["かんたん","詳細"])
+            mode_cb.setCurrentIndex(1 if (getattr(self,"tone_mode","lite")=="pro") else 0)
+            mode_row.addWidget(mode_cb)
+            lay.addLayout(mode_row)
+
+            # 対象（default / per-game）
+            scope_row = QHBoxLayout()
+            scope_row.addWidget(QLabel("対象:"))
+            scope_cb = QComboBox(dlg)
+            games = _discover_tone_games()
+            scope_cb.addItem("デフォルト")
+            for g in games: scope_cb.addItem(g)
+            if getattr(self, "tone_scope", "default") == "game" and getattr(self, "tone_game", "") in games:
+                scope_cb.setCurrentText(getattr(self, "tone_game", ""))
+            else:
+                scope_cb.setCurrentIndex(0)
+            scope_row.addWidget(scope_cb)
+            btn_open_dir = QPushButton("ゲーム用プリセットのフォルダを開く")
+            scope_row.addWidget(btn_open_dir)
+            lay.addLayout(scope_row)
             # プリセット
+            
             presets = self._load_tone_presets()
+
             row = QHBoxLayout()
             row.addWidget(QLabel("プリセット："))
             cb = QComboBox(dlg)
-            cb.addItems(list(presets.keys()))
+
+            def _reload_presets_for_mode_scope():
+                nonlocal presets
+                # update mode by UI
+                self.tone_mode = "pro" if mode_cb.currentIndex()==1 else "lite"
+                sel = scope_cb.currentText()
+                if sel and sel != "デフォルト":
+                    self.tone_scope = "game"; self.tone_game = sel
+                else:
+                    self.tone_scope = "default"; self.tone_game = ""
+                presets = self._load_tone_presets()
+                cb.blockSignals(True)
+                cb.clear()
+                for k in sorted(presets.keys()):
+                    cb.addItem(k)
+                cb.blockSignals(False)
+                if cb.count()>0:
+                    cb.setCurrentIndex(0)
+
+            _reload_presets_for_mode_scope()
+
             row.addWidget(cb, 1)
             btn_save  = QPushButton("現在の内容を新規保存…")
             btn_del   = QPushButton("このプリセットを削除")
@@ -1102,8 +1458,25 @@ class Overlay(QWidget):
                     edit.blockSignals(True)
                     edit.setPlainText(presets[name])
                     edit.blockSignals(False)
-            cb.currentIndexChanged.connect(on_changed)
+            
+            def _on_mode_changed(_i:int): _reload_presets_for_mode_scope()
+            def _on_scope_changed(_i:int): _reload_presets_for_mode_scope()
+            mode_cb.currentIndexChanged.connect(_on_mode_changed)
+            scope_cb.currentIndexChanged.connect(_on_scope_changed)
 
+            def _open_games_dir():
+                try:
+                    d = TONE_GAMES_DIR
+                    if not os.path.isdir(d): os.makedirs(d, exist_ok=True)
+                    if sys.platform == "win32": os.startfile(d)
+                    elif sys.platform == "darwin":
+                        import subprocess; subprocess.Popen(["open", d])
+                    else:
+                        import subprocess; subprocess.Popen(["xdg-open", d])
+                except Exception as e:
+                    if DEBUG: print("[OST] open games dir failed:", e)
+            btn_open_dir.clicked.connect(_open_games_dir)
+            cb.currentIndexChanged.connect(on_changed)
             # ボタン
             btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
             lay.addWidget(btns)
@@ -1121,7 +1494,7 @@ class Overlay(QWidget):
                 presets[name] = edit.toPlainText().strip()
                 self._save_tone_presets(presets)
                 cb.blockSignals(True)
-                cb.clear(); cb.addItems(list(presets.keys()))
+                cb.clear(); cb.addItems(sorted(presets.keys()))
                 cb.setCurrentText(name)
                 cb.blockSignals(False)
                 self.sig_apply_text.emit(f"(口調プリセット「{name}」を保存)")
@@ -1137,7 +1510,7 @@ class Overlay(QWidget):
                     del presets[name]
                     self._save_tone_presets(presets)
                     cb.blockSignals(True)
-                    cb.clear(); cb.addItems(list(presets.keys()))
+                    cb.clear(); cb.addItems(sorted(presets.keys()))
                     cb.blockSignals(False)
                     # 削除後は本文は維持（勝手に消さない）
                     self.sig_apply_text.emit(f"(口調プリセット「{name}」を削除)")
@@ -1254,21 +1627,49 @@ class Overlay(QWidget):
         return ImageFont.load_default()
 
     def _wrap_lines(self, text: str, draw, font, max_w: int):
-        # CJK/英語混在を簡易に折り返し。英語は単語単位、CJKは文字単位。
-        import re
+        """
+        折り返しの厳密版:
+        - 改行は \n に正規化（\r\n / \r -> \n）
+        - 幅は textlength() を優先、無い環境は bbox の (right-left)
+        - 英文はスペース優先、CJK/長語は文字単位で折返し
+        """
+        import re  # モジュール先頭にあるなら不要
+
+        # normalize newlines
+        if text is None:
+            text = ""
+        else:
+            try:
+                text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+            except Exception:
+                text = ""
+
+        def text_width(s: str) -> int:
+            try:
+                return draw.textlength(s, font=font)  # Pillow>=9
+            except Exception:
+                l, t, r, b = draw.textbbox((0, 0), s, font=font)
+                return r - l
+
         lines = []
-        if not text:
-            return lines
         for para in text.splitlines():
+            # defensive: ensure each line is str
+            if not isinstance(para, str):
+                try:
+                    para = str(para)
+                except Exception:
+                    para = ""
             if not para:
                 lines.append("")
                 continue
+
             use_words = bool(re.search(r"[A-Za-z]", para) and " " in para)
             tokens = para.split(" ") if use_words else list(para)
+
             buf = ""
             for t in tokens:
-                cand = (buf + (" " if use_words and buf else "") + t)
-                w = draw.textbbox((0,0), cand, font=font)[2]
+                cand = buf + (" " if use_words and buf else "") + t
+                w = text_width(cand)
                 if w <= max_w or not buf:
                     buf = cand
                 else:
@@ -1276,9 +1677,17 @@ class Overlay(QWidget):
                     buf = t
             if buf:
                 lines.append(buf)
+
         return lines
 
     def _build_and_save_annotated(self, main_img_png: bytes, ja_text: str, src_text: str, include_source: bool) -> str:
+        """
+        右帯(side)で表示しきれない場合は自動で bottom 方式にフォールバック。
+        折り返しは Pillow の textlength/bbox を使って正確に判定する。
+        """
+        from PIL import Image, ImageDraw
+        import io, os, time
+
         base = Image.open(io.BytesIO(main_img_png)).convert("RGB")
         W, H = base.size
 
@@ -1289,16 +1698,73 @@ class Overlay(QWidget):
             ratio = H / max(1, W)
             layout = "side" if ratio >= ANN_SIDE_THRESHOLD else "bottom"
 
+        # fonts
         font_ja  = self._find_ja_font(ANN_FONT_JA_PT  if ANN_FONT_JA_PT  > 0 else max(14, self.font_pt + 2))
         font_src = self._find_ja_font(ANN_FONT_SRC_PT if ANN_FONT_SRC_PT > 0 else max(12, self.font_pt))
 
+        # probe context for metrics
         probe = Image.new("RGB", (10, 10))
         d0 = ImageDraw.Draw(probe)
-        h_ja_line  = d0.textbbox((0,0), "あAg", font=font_ja)[3]
-        h_src_line = d0.textbbox((0,0), "あAg", font=font_src)[3]
+
+        def _h(bb): return (bb[3]-bb[1]) if bb else 0
+        h_label_ja  = _h(d0.textbbox((0,0), "訳文", font=font_ja))
+        h_label_src = _h(d0.textbbox((0,0), "原文", font=font_src))
+        h_ja_line   = _h(d0.textbbox((0,0), "あAg", font=font_ja))
+        h_src_line  = _h(d0.textbbox((0,0), "あAg", font=font_src))
 
         include_src_flag = include_source and bool((src_text or "").strip())
 
+        # helper for text width
+        def _tw(s, f): 
+            try:
+                return d0.textlength(s, font=f)
+            except Exception:
+                l,t,r,b = d0.textbbox((0,0), s, font=f); return r-l
+
+        def _wrap(text, f, max_w):
+            # robust wrapping with binary-search fallback
+            if text is None:
+                text = ""
+            try:
+            # 改行を \n に正規化（Windowsの \r\n / 古い \r を \n に）
+                text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+            except Exception:
+                text = ""
+
+            out = []
+            for para in text.split("\n"):
+                if not para:
+                    out.append("")
+                    continue
+                i, n = 0, len(para)
+                while i < n:
+                    j = i + 1
+                    last_space = -1
+                    while j <= n:
+                        seg = para[i:j]
+                        w = _tw(seg, f)
+                        if w <= max_w:
+                            if seg and seg[-1].isspace():
+                                last_space = j - 1
+                            j += 1
+                        else:
+                            break
+                    if j > n and _tw(para[i:j], f) <= max_w:
+                        out.append(para[i:j]); i = j; continue
+                    if last_space > i:
+                        out.append(para[i:last_space].rstrip()); i = last_space + 1; continue
+                    # force break by binary-search
+                    lo, hi, best = i+1, n, i+1
+                    while lo <= hi:
+                        mid = (lo+hi)//2
+                        if _tw(para[i:mid], f) <= max_w:
+                            best = mid; lo = mid+1
+                        else:
+                            hi = mid-1
+                    out.append(para[i:best]); i = best
+            return out
+
+        # ---- side layout (with overflow check) ----
         if layout == "side":
             side_w = max(120, ANN_SIDE_WIDTH_PX)
             margin = ANN_MARGIN_PX
@@ -1306,83 +1772,83 @@ class Overlay(QWidget):
             gap    = ANN_GAP_PX
             text_w = side_w - margin*2
 
-            lines_src = self._wrap_lines(src_text or "", d0, font_src, text_w) if include_src_flag else []
-            lines_ja  = self._wrap_lines(ja_text  or "", d0, font_ja,  text_w)
+            lines_src = _wrap(src_text or "", font_src, text_w) if include_src_flag else []
+            lines_ja  = _wrap(ja_text  or "", font_ja,  text_w)
 
-            canvas = Image.new("RGB", (W + side_w, H), (0,0,0))
-            canvas.paste(base, (0,0))
-            band = Image.new("RGBA", (side_w, H), (0,0,0,ANN_ALPHA))
-            canvas.paste(band, (W, 0), band)
-
-            d = ImageDraw.Draw(canvas)
-            x = W + margin
-            y = pad
-
+            need_h = pad
             if include_src_flag:
-                d.text((x, y), "原文", font=font_src, fill=(180,180,180))
-                y += h_src_line + 6
-                for line in lines_src:
-                    d.text((x, y), line, font=font_src, fill=(210,210,210))
-                    y += h_src_line + 2
-                y += gap
+                need_h += h_label_src + 6 + (len(lines_src) * (h_src_line + 2) - 2 if lines_src else 0) + gap
+            need_h += h_label_ja + 6 + (len(lines_ja) * (h_ja_line + 2) - 2 if lines_ja else 0) + pad
 
-            d.text((x, y), "訳文", font=font_ja, fill=(235,235,235))
-            y += h_ja_line + 6
-            for line in lines_ja:
-                d.text((x, y), line, font=font_ja, fill=(245,245,245))
-                y += h_ja_line + 2
+            # フィットしなければ bottom に退避
+            if need_h > H:
+                layout = "bottom"
+            else:
+                canvas = Image.new("RGB", (W + side_w, H), (0,0,0))
+                canvas.paste(base, (0,0))
+                band = Image.new("RGBA", (side_w, H), (0,0,0,ANN_ALPHA))
+                canvas.paste(band, (W, 0), band)
 
-            os.makedirs("captures", exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S"); ns = time.time_ns() % 1_000_000_000
-            kind = ("src_ja" if include_src_flag else "ja") + "_side"
-            out_path = os.path.join("captures", f"annotated_{kind}_{ts}_{ns:09d}.png")
-            canvas.save(out_path, "PNG")
-            return out_path
+                d = ImageDraw.Draw(canvas)
+                x = W + margin
+                y = pad
 
-        else:
-            margin = ANN_MARGIN_PX
-            pad    = ANN_PAD_PX
-            gap    = ANN_GAP_PX
-            text_w = W - margin*2
+                if include_src_flag:
+                    d.text((x, y), "原文", font=font_src, fill=(180,180,180)); y += h_label_src + 6
+                    for line in lines_src:
+                        d.text((x, y), line, font=font_src, fill=(210,210,210)); y += h_src_line + 2
+                    y += gap
 
-            lines_src = self._wrap_lines(src_text or "", d0, font_src, text_w) if include_src_flag else []
-            lines_ja  = self._wrap_lines(ja_text  or "", d0, font_ja,  text_w)
+                d.text((x, y), "訳文", font=font_ja, fill=(235,235,235)); y += h_label_ja + 6
+                for line in lines_ja:
+                    d.text((x, y), line, font=font_ja, fill=(245,245,245)); y += h_ja_line + 2
 
-            h_src = h_src_line * max(1, len(lines_src)) + 2 * (len(lines_src) - 1) if include_src_flag else 0
-            h_ja  = h_ja_line  * max(1, len(lines_ja))  + 2 * (len(lines_ja)  - 1)
-            h_label_src = d0.textbbox((0,0), "原文", font=font_src)[3] if include_src_flag else 0
-            h_label_ja  = d0.textbbox((0,0), "訳文", font=font_ja)[3]
+                os.makedirs("captures", exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S"); ns = time.time_ns() % 1_000_000_000
+                kind = ("src_ja" if include_src_flag else "ja") + "_side"
+                out_path = os.path.join("captures", f"annotated_{kind}_{ts}_{ns:09d}.png")
+                canvas.save(out_path, "PNG")
+                return out_path
 
-            area_h = pad + (h_label_src + 6 + h_src + gap if include_src_flag else 0) + h_label_ja + 6 + h_ja + pad
+        # ---- bottom layout (default or fallback) ----
+        margin = ANN_MARGIN_PX
+        pad    = ANN_PAD_PX
+        gap    = ANN_GAP_PX
+        text_w = W - margin*2
 
-            canvas = Image.new("RGB", (W, H + area_h), (0,0,0))
-            canvas.paste(base, (0,0))
-            band = Image.new("RGBA", (W, area_h), (0,0,0,ANN_ALPHA))
-            canvas.paste(band, (0, H), band)
+        lines_src = _wrap(src_text or "", font_src, text_w) if include_src_flag else []
+        lines_ja  = _wrap(ja_text  or "", font_ja,  text_w)
 
-            d = ImageDraw.Draw(canvas)
-            y = H + pad
+        h_src = (len(lines_src) * (h_src_line + 2) - 2) if include_src_flag and lines_src else 0
+        h_ja  = (len(lines_ja)  * (h_ja_line  + 2) - 2) if lines_ja else 0
 
-            if include_src_flag:
-                d.text((margin, y), "原文", font=font_src, fill=(180,180,180))
-                y += h_label_src + 6
-                for line in lines_src:
-                    d.text((margin, y), line, font=font_src, fill=(210,210,210))
-                    y += h_src_line + 2
-                y += gap
+        area_h = pad + (h_label_src + 6 + h_src + gap if include_src_flag else 0) + h_label_ja + 6 + h_ja + pad
 
-            d.text((margin, y), "訳文", font=font_ja, fill=(235,235,235))
-            y += h_label_ja + 6
-            for line in lines_ja:
-                d.text((margin, y), line, font=font_ja, fill=(245,245,245))
-                y += h_ja_line + 2
+        canvas = Image.new("RGB", (W, H + area_h), (0,0,0))
+        canvas.paste(base, (0,0))
+        band = Image.new("RGBA", (W, area_h), (0,0,0,ANN_ALPHA))
+        canvas.paste(band, (0, H), band)
 
-            os.makedirs("captures", exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S"); ns = time.time_ns() % 1_000_000_000
-            kind = ("src_ja" if include_src_flag else "ja") + "_bottom"
-            out_path = os.path.join("captures", f"annotated_{kind}_{ts}_{ns:09d}.png")
-            canvas.save(out_path, "PNG")
-            return out_path
+        d = ImageDraw.Draw(canvas)
+        y = H + pad
+
+        if include_src_flag:
+            d.text((margin, y), "原文", font=font_src, fill=(180,180,180)); y += h_label_src + 6
+            for line in lines_src:
+                d.text((margin, y), line, font=font_src, fill=(210,210,210)); y += h_src_line + 2
+            y += gap
+
+        d.text((margin, y), "訳文", font=font_ja, fill=(235,235,235)); y += h_label_ja + 6
+        for line in lines_ja:
+            d.text((margin, y), line, font=font_ja, fill=(245,245,245)); y += h_ja_line + 2
+
+        os.makedirs("captures", exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S"); ns = time.time_ns() % 1_000_000_000
+        kind = ("src_ja" if include_src_flag else "ja") + "_bottom"
+        out_path = os.path.join("captures", f"annotated_{kind}_{ts}_{ns:09d}.png")
+        canvas.save(out_path, "PNG")
+        return out_path
+
 
     def save_annotated_image(self, include_source: bool = False):
         # 直近の翻訳に使った画像＋訳文（＋原文）で併記画像を保存
@@ -1400,6 +1866,191 @@ class Overlay(QWidget):
         except Exception as e:
             self.sig_apply_text.emit(f"(保存に失敗: {e})")
 
+
+    # ---- 画像ファイルからの翻訳（ダイアログ起点）----
+    def _open_images_and_translate(self):
+        self._suspend_hotkeys()
+        _paused_topmost = False
+        try:
+            if hasattr(self, "_topmost_timer") and self._topmost_timer:
+                try:
+                    self._topmost_timer.stop(); _paused_topmost = True
+                except Exception:
+                    pass
+
+            parent = self.ctrl_panel if getattr(self, "ctrl_panel", None) else self
+            start_dir = getattr(self, "_last_image_dir", None)
+            dlg = ImagePickerDialog(parent, start_dir)
+            files = dlg.selected_files() if dlg.exec() else []
+            if not files:
+                return
+            # 記憶：次回の開始ディレクトリ
+            import os
+            try:
+                self._last_image_dir = os.path.dirname(files[0])
+            except Exception:
+                pass
+            self._translate_from_paths(files)
+        finally:
+            if _paused_topmost:
+                try: self._topmost_timer.start()
+                except Exception: pass
+            self._resume_hotkeys()
+    # ---- パス列を受けて翻訳を開始 ----
+    def _translate_from_paths(self, paths):
+        # 更新日時（古い→新しい）で整列
+        try:
+            paths = self._sort_paths_by_mtime(list(paths), reverse=False)
+        except Exception:
+            pass
+        if self.state.busy or self._exiting:
+            self.sig_apply_text.emit("(実行中のため受け付けません)")
+            return
+        try:
+            from PIL import Image, ImageEnhance
+            import io, os
+            imgs = []
+            for fp in paths:
+                if not os.path.exists(fp):
+                    continue
+                im = Image.open(fp)
+                im = im.convert("RGB")
+                if OST_PREPROCESS:
+                    im = im.convert("L")
+                    im = ImageEnhance.Brightness(im).enhance(1.12)
+                    im = ImageEnhance.Contrast(im).enhance(1.32)
+                    im = ImageEnhance.Sharpness(im).enhance(1.1)
+                elif CONCAT_MODE_L in ("L","RGB"):
+                    im = im.convert(CONCAT_MODE_L)
+                imgs.append(im)
+            if not imgs:
+                self.sig_apply_text.emit("(有効な画像が見つかりません)")
+                return
+
+            # 1枚→そのまま / 複数→縦連結
+            if len(imgs) == 1:
+                buf = io.BytesIO()
+                imgs[0].save(buf, format="PNG")
+                main_png = buf.getvalue()
+            else:
+                W = max(im.width for im in imgs)
+                converted = []
+                for im in imgs:
+                    if im.width != W:
+                        H = int(im.height * (W / im.width))
+                        converted.append(im.resize((W, H), Image.BICUBIC))
+                    else:
+                        converted.append(im.copy())
+                total_h = sum(im.height for im in converted) + CONCAT_GAP_PX * (len(converted) - 1)
+                mode = "L" if CONCAT_MODE_L == "L" else "RGB"
+                bg = 0 if mode == "L" else (0, 0, 0)
+                canvas = Image.new(mode, (W, total_h), bg)
+                y = 0
+                sep_color = 180 if mode == "L" else (180, 180, 180)
+                for i, im in enumerate(converted):
+                    canvas.paste(im, (0, y)); y += im.height
+                    if i != len(converted) - 1 and CONCAT_GAP_PX > 0:
+                        for yy in range(CONCAT_GAP_PX):
+                            for xx in range(W):
+                                canvas.putpixel((xx, y + yy), sep_color)
+                        y += CONCAT_GAP_PX
+                buf = io.BytesIO()
+                canvas.save(buf, format="PNG")
+                main_png = buf.getvalue()
+
+            self._start_translation_with_images(main_png, None, note="(画像から翻訳)")
+        except Exception as e:
+            self.sig_apply_text.emit(f"(画像読み込みに失敗: {e})")
+
+    # ---- 直渡し画像で翻訳（キャプチャを使わず） ----
+    def _start_translation_with_images(self, main_img_png: bytes, speaker_img_png: Optional[bytes], note: str = "") -> None:
+        if self.state.busy or self._exiting:
+            return
+        if not self.api_key:
+            self.sig_apply_text.emit("（APIキー未設定：GEMINI_API_KEY または GOOGLE_API_KEY を設定してください）")
+            return
+
+        self.cancel_evt.clear()
+        self.active_job_id += 1
+        job_id = self.active_job_id
+        self.sig_set_busy.emit(True)
+        self._last_main_img_png = main_img_png  # 注釈保存で使用
+
+        def worker(mi, si, jid):
+            try:
+                if self.cancel_evt.is_set() or jid != self.active_job_id:
+                    return
+                text = self._call_gemini_rest_with_retry(mi, si)
+                if self.cancel_evt.is_set() or jid != self.active_job_id:
+                    return
+                self.sig_apply_text.emit(text if text else "（文字が見つかりません）")
+                if OST_SAVE_ANNOTATED:
+                    try:
+                        self._build_and_save_annotated(self._last_main_img_png, text, getattr(self, "last_source_text", ""), OST_ANN_INCLUDE_SRC)
+                    except Exception as e:
+                        if DEBUG:
+                            print("[OST] annotated save failed:", e)
+                            import traceback
+                            print(traceback.format_exc(limit=2))
+                        import traceback
+                        self.sig_apply_text.emit(f"（翻訳に失敗しました: {e}\\n{traceback.format_exc(limit=2)}）")
+            finally:
+                self._concat_list.clear()
+                self.sig_concat_cnt.emit(0)
+                self.sig_set_busy.emit(False)
+
+        import threading
+        threading.Thread(target=worker, args=(main_img_png, speaker_img_png, job_id), daemon=True).start()
+        if note:
+            self.sig_apply_text.emit(note)
+
+    # ---- 直近の保存ファイルから再翻訳 ----
+    def _retry_from_last_saved(self):
+        if self.state.busy or self._exiting:
+            return
+        cap_dir = "captures"
+        try:
+            latest_main = None; latest_mtime = -1.0
+            latest_concat = None; latest_concat_mtime = -1.0
+            import os, io, re
+            if os.path.isdir(cap_dir):
+                for fn in os.listdir(cap_dir):
+                    fp = os.path.join(cap_dir, fn)
+                    if not os.path.isfile(fp):
+                        continue
+                    low = fn.lower()
+                    try:
+                        mt = os.path.getmtime(fp)
+                    except Exception:
+                        mt = 0.0
+                    if low.startswith("used_main_") and low.endswith(".png") and mt > latest_mtime:
+                        latest_main, latest_mtime = fp, mt
+                    if low.startswith("concat_") and low.endswith(".png") and mt > latest_concat_mtime:
+                        latest_concat, latest_concat_mtime = fp, mt
+
+            if latest_main:
+                m = re.match(r"used_main_(\\d{8}_\\d{6})_(\\d{9})\\.png$", os.path.basename(latest_main))
+                sp_png = None
+                if m:
+                    sp_name = f"used_speaker_{m.group(1)}_{m.group(2)}.png"
+                    sp_path = os.path.join(cap_dir, sp_name)
+                    if os.path.exists(sp_path):
+                        with open(sp_path, "rb") as f:
+                            sp_png = f.read()
+                with open(latest_main, "rb") as f:
+                    mi = f.read()
+                self._start_translation_with_images(mi, sp_png, note=f"(再翻訳: {os.path.basename(latest_main)})")
+                return
+
+            if latest_concat:
+                with open(latest_concat, "rb") as f:
+                    mi = f.read()
+                self._start_translation_with_images(mi, None, note=f"(再翻訳: {os.path.basename(latest_concat)})")
+                return
+
+            self.sig_apply_text.emit("(再翻訳対象が見つかりません。captures に used_main_* または concat_* がありません)")
+        except Exception as e:
+            self.sig_apply_text.emit(f"(再翻訳に失敗: {e})")
     # ---- 翻訳 ----
     def trigger_translate(self):
         if self.state.busy or self._exiting: return
@@ -1444,10 +2095,13 @@ class Overlay(QWidget):
                     try:
                         self._build_and_save_annotated(self._last_main_img_png, text, getattr(self, "last_source_text", ""), OST_ANN_INCLUDE_SRC)
                     except Exception as e:
-                        if DEBUG: print("[OST] annotated save failed:", e)
-            except Exception as e:
-                if not self.cancel_evt.is_set():
-                    self.sig_apply_text.emit(f"（翻訳に失敗しました: {e}）")
+                        if DEBUG:
+                            print("[OST] annotated save failed:", e)
+                            import traceback
+                            print(traceback.format_exc(limit=2))
+                         # ユーザーにも通知
+                        import traceback
+                        self.sig_apply_text.emit(f"（翻訳に失敗しました: {e}\n{traceback.format_exc(limit=2)}）")
             finally:
                 # 連結バッファのクリアとカウンタ更新
                 self._concat_list.clear()
@@ -1628,76 +2282,229 @@ class Overlay(QWidget):
         if last: raise last
         return ""
 
+    
     def _call_gemini_rest_once(self, main_img_png: bytes, speaker_img_png: Optional[bytes]) -> str:
-        parts = []
-        persona = []
-        if self.speaker: persona.append(f"話者名は「{self.speaker}」。")
-        if self.tone:    persona.append(f"口調/文体は「{self.tone}」。")
-        persona_str = " ".join(persona) if persona else "話者/口調は特に指定なし。"
-
-        if KEEP_SOURCE:
-            prompt = (
-              "あなたはゲームUI/台詞の実務翻訳者です。画像からテキストを正確に読み取り、日本語に翻訳してください。"
-              + persona_str +
-              " 出力は必ず次のJSON文字列のみ："
-              ' {"source":"OCRで認識した原文（読み取れた言語のまま）","ja":"自然な日本語訳"}  '
-              "。他の文字や説明は一切不要。読み取れない場合は source は空文字、ja は「（文字が見つかりません）」にしてください。"
-              " 2枚目の画像があれば話者のヒントとして参照してください。"
-            )
-        else:
-            prompt = ("あなたはゲームUI/台詞の実務翻訳者です。以下の画像から検出できるテキスト（言語は自動判定）を正確に読み取り、日本語に翻訳してください。"
-                      "意味は変えず、ゲームの文脈に合う自然な台詞として表現します。"
-                      + persona_str +
-                      " もし2枚目の画像が与えられていれば、それは「話者名が出る欄/立ち絵など話者ヒント」です。"
-                      " それを参考に、上記の口調を保ちながら不自然にならない範囲で言い回しを調整してください。"
-                      " 出力は日本語訳のみ。注釈や説明は不要。読み取れない場合は「（文字が見つかりません）」と返してください。")
-
-        parts.append({"text": prompt})
-        parts.append({"inline_data": {"mime_type":"image/png","data": base64.b64encode(main_img_png).decode("ascii")}})
+        # --- Strict JSON 出力 & 画像最適化 ---
+        main_img_png = self._optimize_png_for_api(main_img_png)
         if speaker_img_png:
-            parts.append({"text":"以下は話者のヒント（名前枠/立ち絵など）です。"})
-            parts.append({"inline_data": {"mime_type":"image/png","data": base64.b64encode(speaker_img_png).decode("ascii")}})
+            speaker_img_png = self._optimize_png_for_api(speaker_img_png)
 
-        payload = {"contents":[{"role":"user","parts":parts}], "safetySettings":[
-            {"category":"HARM_CATEGORY_DANGEROUS_CONTENT","threshold":"BLOCK_NONE"},
-            {"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_NONE"},
-            {"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"},
-            {"category":"HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold":"BLOCK_NONE"}]}
+        def build_payload(request_source: bool, img_png: bytes):
+            """request_source=True: {"source","ja"} / False: {"ja"} only"""
+            persona = []
+            if self.speaker: persona.append(f"話者名は「{self.speaker}」。")
+            if self.tone:    persona.append(f"口調/文体は「{self.tone}」。")
+            persona_str = " ".join(persona) if persona else "話者/口調は特に指定なし。"
+
+            constraint_text = (
+                 " 出力は必ず1行のJSONのみ。前置き/後置き/解説/理由/箇条書き/Markdown/コードフェンス/引用符は禁止。"
+            ) if getattr(self, 'tone_mode', 'lite') == 'pro' else ""
+
+            parts = []
+            if KEEP_SOURCE and request_source:
+                prompt = (
+                  "あなたはゲームUI/台詞の実務翻訳者です。画像からテキストを正確に読み取り、日本語に翻訳してください。"
+                  + persona_str + constraint_text +
+                  " 原文の改行（行区切り）は可能な限り維持し、同じ箇所で `ja` にも改行を入れてください。"
+                  " 出力は必ず次のJSON文字列のみ："
+                  ' {\"source\":\"OCRで認識した原文（読み取れた言語のまま）\",\"ja\":\"自然な日本語訳\"}  '
+                  "。他の文字や説明は一切不要。読み取れない場合は source は空文字、ja は「（文字が見つかりません）」にしてください。"
+                  " 2枚目の画像があれば話者のヒントとして参照してください。"
+                )
+            else:
+                prompt = (
+                  "あなたはゲームUI/台詞の実務翻訳者です。画像から読めるテキストを正確に日本語へ翻訳してください。"
+                  + persona_str + constraint_text +
+                  " 原文の改行（行区切り）は可能な限り維持し、同じ箇所で `ja` にも改行を入れてください。"
+                  " 出力は必ず次のJSON文字列のみ： {\"ja\":\"自然な日本語訳\"} 。他の文字や説明は一切不要。"
+                )
+            parts.append({ "text": prompt })
+            parts.append({ "inline_data": { "mime_type":"image/png", "data": base64.b64encode(img_png).decode("ascii") } })
+            if speaker_img_png:
+                parts.append({ "text":"以下は話者のヒント（名前枠/立ち絵など）です。" })
+                parts.append({ "inline_data": { "mime_type": "image/png", "data": base64.b64encode(speaker_img_png).decode("ascii") } })
+
+            if KEEP_SOURCE and request_source:
+                sys_text = (
+                    'あなたは画像からテキストを抽出して日本語へ翻訳するエージェント。'
+                    '常に JSON のみを返答： {\"source\":\"原文\",\"ja\":\"日本語訳\"}。'
+                    '前置き・後置き・説明・コードフェンスは禁止。キーは source と ja だけ。'
+                )
+                resp_schema = {
+                    "type":"object",
+                    "properties":{
+                        "source":{"type":"string"},
+                        "ja":{"type":"string"}
+                    },
+                    "required":["source","ja"]
+                }
+            else:
+                sys_text = (
+                    'あなたは画像からテキストを読み取り日本語へ翻訳するエージェント。'
+                    '常に JSON のみを返答： {\"ja\":\"日本語訳\"}。'
+                    '前置きや後置き、コードフェンスは禁止。キーは ja のみ。'
+                )
+                resp_schema = {
+                    "type":"object",
+                    "properties":{"ja":{"type":"string"}},
+                    "required":["ja"]
+                }
+
+            gen_cfg = {
+                "candidateCount": 1,
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+                "responseSchema": resp_schema
+            }
+            payload = {
+                "systemInstruction": {"role":"system","parts":[{"text": sys_text}]},
+                "contents": [{"role":"user","parts": parts}],
+                "generationConfig": gen_cfg,
+                "safetySettings": [
+                    {"category":"HARM_CATEGORY_DANGEROUS_CONTENT","threshold":"BLOCK_NONE"},
+                    {"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_NONE"},
+                    {"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"},
+                    {"category":"HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold":"BLOCK_NONE"}
+                ],
+            }
+            return payload
+
         headers = {"x-goog-api-key": (self.api_key or ""), "Content-Type":"application/json; charset=utf-8"}
 
-        resp = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        if resp.status_code >= 400: raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:800]}")
-        data = resp.json()
+        def request_once(request_source: bool, img_png: bytes):
+            payload = build_payload(request_source, img_png)
+            resp = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            if resp.status_code >= 400: 
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:800]}")
+            data = resp.json()
+            cands = data.get("candidates") or []
+            cand = cands[0] if cands else None
+            return data, cand
 
-        cands = data.get("candidates") or []
-        cand = cands[0] if cands else None
+        # 1st attempt: request_source = KEEP_SOURCE
+        request_source = bool(KEEP_SOURCE)
+        data, cand = request_once(request_source, main_img_png)
+
+        # エラー/停止理由
         if not cand:
             pf = data.get("promptFeedback") or {}
             return f"(空応答: {('blocked:'+str(pf)) if pf else str(data)[:400]})"
 
         finish = cand.get("finishReason")
-        if finish and finish != "STOP": return f"(モデルが出力を停止: finishReason={finish} details={str(cand)[:300]})"
 
+        # RECITATION: もう一度、『訳文のみ』で再試行
+        if finish == "RECITATION" and request_source:
+            if OST_RECITATION_AUTO and OST_RECITATION_JA_RETRY:
+                self.sig_apply_text.emit("（有名/既知の本文と判定され出力が停止されたため、訳文のみで再翻訳しています…）")
+                if DEBUG: print("[OST] recitation detected; retry with JA-only schema")
+                request_source = False
+                data, cand = request_once(request_source, main_img_png)
+                finish = cand.get("finishReason")
+            elif OST_SLICE_ON_RECITATION:
+                self.sig_apply_text.emit("（有名/既知の本文と判定されたため、画像を分割して再翻訳しています…）")
+                if DEBUG: print("[OST] recitation detected; skip JA-only retry; slicing image")
+                ja_all = []
+                for sub_png in self._slice_png_vertical(main_img_png, OST_SLICE_PARTS):
+                    try:
+                        sub_png_opt = self._optimize_png_for_api(sub_png)
+                    except Exception:
+                        sub_png_opt = sub_png
+                    data2, cand2 = request_once(False, sub_png_opt)
+                    if not cand2:
+                        continue
+                    parts_out2 = (cand2.get("content") or {}).get("parts") or []
+                    raw2 = ""
+                    for p2 in parts_out2:
+                        if isinstance(p2, dict) and "text" in p2 and p2["text"]:
+                            raw2 += p2["text"]
+                    raw2 = (raw2 or "").strip()
+                    try:
+                        obj2 = json.loads(raw2) if raw2 else {}
+                        if isinstance(obj2, dict) and "ja" in obj2:
+                            j = (obj2.get("ja") or "").strip()
+                            if j:
+                                ja_all.append(j)
+                    except Exception:
+                        if raw2:
+                            ja_all.append(raw2)
+                if ja_all:
+                    self.last_source_text = ""
+                    return "".join(ja_all)
+                    
+        if finish and finish != "STOP":
+            # 最終手段: JA-onlyでさらにRECITATIONなら、画像を縦に分割して逐次翻訳（意訳）
+            if finish == "RECITATION" and not request_source and OST_SLICE_ON_RECITATION:
+                self.sig_apply_text.emit("（依然として出力が停止されたため、画像を分割して再翻訳しています…）")
+                if DEBUG: print("[OST] recitation again; slicing image and concatenating JA")
+                ja_all = []
+                for sub_png in self._slice_png_vertical(main_img_png, OST_SLICE_PARTS):
+                    # 送信前に最適化（長辺を縮小）— _optimize_png_for_api が無ければ sub_png のままでOK
+                    try:
+                        sub_png_opt = self._optimize_png_for_api(sub_png)
+                    except Exception:
+                        sub_png_opt = sub_png
+                    data2, cand2 = request_once(False, sub_png_opt)
+                    if not cand2:
+                        continue
+                    parts_out2 = (cand2.get("content") or {}).get("parts") or []
+                    raw2 = ""
+                    for p2 in parts_out2:
+                        if isinstance(p2, dict) and "text" in p2 and p2["text"]:
+                            raw2 += p2["text"]
+                    raw2 = (raw2 or "").strip()
+                    try:
+                        obj2 = json.loads(raw2) if raw2 else {}
+                        if isinstance(obj2, dict) and "ja" in obj2:
+                            j = (obj2.get("ja") or "").strip()
+                            if j:
+                                ja_all.append(j)
+                    except Exception:
+                        if raw2:
+                            ja_all.append(raw2)
+                if ja_all:
+                    self.last_source_text = ""
+                    return "\n".join(ja_all)
+            # ここまで来たら素直に停止理由を返す
+            return f"(モデルが出力を停止: finishReason={finish} details={str(cand)[:300]})"
+
+        # 本文取り出し
         parts_out = (cand.get("content") or {}).get("parts") or []
-        text = ""
+        raw = ""
         for p in parts_out:
             if isinstance(p, dict) and "text" in p and p["text"]:
-                text += p["text"]
-        text = (text or "").strip()
+                raw += p["text"]
+        raw = (raw or "").strip()
 
-        # ★ JSONから原文と訳文を抽出（UIには訳文のみ表示）
-        if KEEP_SOURCE:
-            src, ja = self._extract_source_ja(text)
+        # JSON parse
+        try:
+            obj = json.loads(raw) if raw else {}
+        except Exception:
+            obj = {}
+
+        if request_source:
+            # {"source","ja"} 期待
+            src = ""
+            ja = ""
+            if isinstance(obj, dict):
+                src = obj.get("source") or ""
+                ja  = obj.get("ja") or ""
+            else:
+                # 後方互換：旧パーサで救済
+                src, ja = self._extract_source_ja(raw)
             self.last_source_text = (src or "").strip()
             ja = (ja or "").strip()
-            if ja:
-                return ja                     # ← ★ 訳文欄には ja だけ
-            if src:
-                return src                    # フォールバック（ja空のとき）
+            if ja: return ja
+            if src: return src
             return "（文字が見つかりません）"
         else:
+            # {"ja"} 期待
             self.last_source_text = ""
-            return text if text else "(空応答)"
+            if isinstance(obj, dict) and "ja" in obj:
+                ja = (obj.get("ja") or "").strip()
+                return ja if ja else "（文字が見つかりません）"
+            # JSONで無ければ raw テキストを返す
+            return raw if raw else "（文字が見つかりません）"
+
 
     # ---- 調整 ----
     def _font_smaller(self): self.font_pt = max(8, self.font_pt - 1); self.update()
@@ -1755,6 +2562,13 @@ class Overlay(QWidget):
             self._hk(fn)
 
     def _poll_keys(self):
+        # 応答中はキャンセル(Alt+X)以外のポーリングを無効化
+        if self.state.busy:
+            if sys.platform == 'win32' and not self._hotkeys_off:
+                alt = self._is_down('alt'); shift = self._is_down('shift'); ctrl = self._is_down('ctrl')
+                if (alt and not shift and not ctrl) and self._edge('alt+x', self._is_down('x')):
+                    self._fire_once('alt+x', self.trigger_cancel)
+            return
         if sys.platform != "win32": return
         if self._hotkeys_off: return
         alt = self._is_down("alt"); shift = self._is_down("shift"); ctrl = self._is_down("ctrl")
@@ -1771,6 +2585,8 @@ class Overlay(QWidget):
                 ("ctrl+shift+s","s", (shift and ctrl and not alt), self._clear_speaker),
                 ("alt+a","a", (alt and not shift), self._concat_append),
                 ("alt+d","d", (alt and not shift), self._concat_clear),
+                ("alt+o","o", (alt and not shift and not ctrl), self._open_images_and_translate),
+                ("alt+shift+r","r", (alt and shift and not ctrl), self._retry_from_last_saved),
                 ("alt+x","x", (alt and not shift and not ctrl), self.trigger_cancel),
             ]
         combos += [
@@ -1825,5 +2641,345 @@ def main():
     app = QApplication(sys.argv); app.setApplicationDisplayName("ScreenTranslate (Gemini) v1")
     w = Overlay(); sys.exit(app.exec())
 
+
+# ===== LASSO INTEGRATION APPENDIX =====
+# 既存の Overlay を継承し、自由選択（Alt+Shift+C）を追加。
+# 最後に Overlay をこのクラスで差し替えます（既存コードの大半は無改変）。
+
+from PySide6.QtGui import QPainter, QPen, QColor, QPolygon
+from PySide6.QtCore import Qt, QRect, QPoint
+import mss
+from PIL import Image, ImageDraw, ImageEnhance
+
+class _LassoOverlay(Overlay):
+    def __init__(self):
+        super().__init__()
+        self.free_selecting = False
+        self._free_dragging = False
+        self.free_path = []          # list[QPoint]
+        self.use_free_roi = False
+        self._rect_selecting_active = False
+        # hotkey
+        try:
+            import keyboard
+            keyboard.add_hotkey('alt+shift+c', lambda: self._hk(self.start_free_select_mode))
+        except Exception:
+            pass
+        # GUIボタン（あれば）
+        try:
+            if hasattr(self, "ctrl_panel") and self.ctrl_panel:
+                from PySide6.QtWidgets import QPushButton
+                self.btn_lasso = QPushButton("自由選択 (Alt+Shift+C)", self.ctrl_panel)
+                lay0 = self.ctrl_panel.layout().itemAt(0).layout() if self.ctrl_panel.layout() else None
+                if lay0:
+                    lay0.addWidget(self.btn_lasso, 0, 2)
+                self.btn_lasso.clicked.connect(lambda: self._hk(self.start_free_select_mode))
+        except Exception:
+            pass
+
+        # 既存のキャンセルボタンは GUI 上では非表示（ラッソボタンを同位置に置くため）
+        try:
+            if hasattr(self, "ctrl_panel") and self.ctrl_panel and hasattr(self.ctrl_panel, "btn_cancel"):
+                self.ctrl_panel.btn_cancel.setVisible(False)
+        except Exception:
+            pass
+
+        # 実行中は「翻訳(ALT+T)」ボタンを「キャンセル(Alt+X)」に差し替える（押下で中断）
+        try:
+            if hasattr(self, "ctrl_panel") and self.ctrl_panel and hasattr(self.ctrl_panel, "btn_t"):
+                import types
+                _orig_set_busy = self.ctrl_panel.set_busy
+                overlay_ref = self
+                def _set_busy_swap(this, b: bool, _orig=_orig_set_busy, _o=overlay_ref):
+                    # まず既存の busy UI を反映
+                    try:
+                        _orig(b)
+                    except Exception:
+                        pass
+                    # その上で「翻訳」ボタンの表示/動作を差し替え
+                    try:
+                        if b:
+                            this.btn_t.setText("キャンセル (Alt+X)")
+                            try: this.btn_t.clicked.disconnect()
+                            except Exception: pass
+                            this.btn_t.clicked.connect(lambda: _o._hk(_o.trigger_cancel))
+                            this.btn_t.setEnabled(True)  # 中断は常に押せるように
+                        else:
+                            this.btn_t.setText("翻訳 (ALT+T)")
+                            try: this.btn_t.clicked.disconnect()
+                            except Exception: pass
+                            this.btn_t.clicked.connect(lambda: _o._hk(_o.trigger_translate))
+                            this.btn_t.setEnabled(True)
+                        # 別のキャンセルボタンは見せない
+                        if hasattr(this, "btn_cancel"):
+                            this.btn_cancel.setVisible(False)
+                    except Exception:
+                        pass
+                self.ctrl_panel.set_busy = types.MethodType(_set_busy_swap, self.ctrl_panel)
+        except Exception:
+            pass
+
+    def _install_hotkeys(self):
+        super()._install_hotkeys()
+        try:
+            import keyboard
+            keyboard.add_hotkey('alt+shift+c', lambda: self._hk(self.start_free_select_mode))
+        except Exception:
+            pass
+
+    def start_select_mode(self):
+        self._rect_selecting_active = True
+        return super().start_select_mode()
+
+    def start_free_select_mode(self):
+        if getattr(self, "edit_main", False) or getattr(self, "edit_speaker", False):
+            self.edit_main = False; self.edit_speaker = False
+        self.hover_edit_main = False
+        self.hover_edit_speaker = False
+        self._auto_grab = False
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.free_selecting = True
+        self._free_dragging = False
+        self.free_path = []
+        self.state.selecting = False
+        if hasattr(self, "_drag_rect"):
+            self._drag_rect = QRect()
+        self.update()
+
+    def _poll_keys(self):
+        try:
+            super()._poll_keys()
+        finally:
+            try:
+                if sys.platform == "win32" and not getattr(self, "_hotkeys_off", False):
+                    alt = self._is_down("alt"); shift = self._is_down("shift"); c = self._is_down("c")
+                    now = (alt and shift and c)
+                    prev = getattr(self, "_prev_lasso", False)
+                    setattr(self, "_prev_lasso", now)
+                    if now and not prev:
+                        self._hk(self.start_free_select_mode)
+            except Exception:
+                pass
+        return
+
+    def paintEvent(self, e):
+        saved_show = getattr(self, "show_main_frame", True)
+        saved_selecting = getattr(self.state, "selecting", False)
+        if self.use_free_roi or self.free_selecting:
+            self.show_main_frame = False
+            if self.free_selecting:
+                self.state.selecting = True
+        super().paintEvent(e)
+        self.show_main_frame = saved_show
+        self.state.selecting = saved_selecting
+
+        p = QPainter(self); p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        if self.use_free_roi and len(self.free_path) >= 3:
+            p.setPen(QPen(self.BORDER_COLOR, self.BORDER_WIDTH)); p.setBrush(Qt.NoBrush)
+            p.drawPolygon(QPolygon(self.free_path))
+        if self.free_selecting and len(self.free_path) >= 2:
+            p.setPen(QPen(QColor(255,255,255,230), 2, Qt.DashLine)); p.setBrush(Qt.NoBrush)
+            p.drawPolyline(QPolygon(self.free_path))
+            p.setPen(QPen(QColor(200,200,200,160), 1, Qt.DotLine))
+            p.drawLine(self.free_path[-1], self.free_path[0])
+        p.end()
+
+    def mousePressEvent(self, e):
+        if self.free_selecting and e.button() == Qt.LeftButton:
+            pos = e.position().toPoint()
+            self.free_path = [pos]; self._free_dragging = True; self.update(); return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self.free_selecting and self._free_dragging:
+            pos = e.position().toPoint()
+            self.free_path.append(pos); self.update(); return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self.free_selecting and e.button() == Qt.LeftButton:
+            self._free_dragging = False
+            if len(self.free_path) >= 3:
+                if self.free_path[-1] != self.free_path[0]:
+                    self.free_path.append(self.free_path[0])
+                self.use_free_roi = True
+                xs = [pt.x() for pt in self.free_path]; ys = [pt.y() for pt in self.free_path]
+                left, right = min(xs), max(xs); top, bottom = min(ys), max(ys)
+                self.state.roi = QRect(left, top, right-left, bottom-top)
+                self.edit_main = False; self.hover_edit_main = False
+            else:
+                self.use_free_roi = False; self.free_path = []
+            self.free_selecting = False
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self.update(); return
+
+        super().mouseReleaseEvent(e)
+
+        if self._rect_selecting_active and e.button() == Qt.LeftButton:
+            self._rect_selecting_active = False
+            if self.use_free_roi:
+                self.use_free_roi = False; self.free_path = []; self.update()
+
+    def _auto_edit_hover(self):
+        if self.use_free_roi or self.free_selecting:
+            return
+        super()._auto_edit_hover()
+
+    def _grab_roi_png_ui_thread(self) -> bytes:
+        if self.use_free_roi and len(self.free_path) >= 3:
+            return self._grab_free_polygon_png_ui_thread()
+        return super()._grab_roi_png_ui_thread()
+
+    def _grab_free_polygon_png_ui_thread(self) -> bytes:
+        roi_box = QRect(self.state.roi)
+        old_opacity = None; panel_old_opacity = None; msg_old_opacity = None
+        if OST_HIDE_ON_CAPTURE or getattr(self, "msg_outside", False):
+            old_opacity = self.windowOpacity(); self.setWindowOpacity(0.0)
+            if self.ctrl_panel and self.ctrl_panel.isVisible():
+                panel_old_opacity = self.ctrl_panel.windowOpacity(); self.ctrl_panel.setWindowOpacity(0.0)
+            if self.msg_panel and self.msg_panel.isVisible():
+                msg_old_opacity = self.msg_panel.windowOpacity(); self.msg_panel.setWindowOpacity(0.0)
+            from PySide6.QtGui import QGuiApplication
+            from PySide6.QtCore import QThread
+            QGuiApplication.processEvents(); QThread.msleep(16)
+
+        try:
+            with mss.mss() as sct:
+                if OST_PRIMARY_ONLY:
+                    ps = QGuiApplication.primaryScreen(); ps_geo = ps.geometry()
+                    idx = max(1, min(OST_MON_INDEX, len(sct.monitors) - 1))
+                    mon = sct.monitors[idx]
+                    sx = mon["width"]/ps_geo.width(); sy = mon["height"]/ps_geo.height()
+                    region = {
+                        "left":   mon["left"] + int(roi_box.left()   * sx),
+                        "top":    mon["top"]  + int(roi_box.top()    * sy),
+                        "width":  max(1, int(roi_box.width()  * sx)),
+                        "height": max(1, int(roi_box.height() * sy)),
+                    }
+                    off_x, off_y = roi_box.left(), roi_box.top()
+                else:
+                    global_center = self.mapToGlobal(roi_box.center())
+                    scale = self._screen_scale_for_point(global_center)
+                    region = {
+                        "left":   int(roi_box.left()   * scale),
+                        "top":    int(roi_box.top()    * scale),
+                        "width":  max(1, int(roi_box.width()  * scale)),
+                        "height": max(1, int(roi_box.height() * scale)),
+                    }
+                    sx = sy = scale; off_x, off_y = roi_box.left(), roi_box.top()
+
+                shot = sct.grab(region)
+                base = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+
+            pts = [(int((pt.x()-off_x)*sx), int((pt.y()-off_y)*sy)) for pt in self.free_path]
+            mask = Image.new("L", (base.width, base.height), 0)
+            d = ImageDraw.Draw(mask); d.polygon(pts, fill=255)
+            mask = mask.filter(ImageFilter.GaussianBlur(0.8))  # ← 追加
+            result = Image.new("RGB", base.size, (24, 24, 24)); result.paste(base, (0,0), mask)
+
+        finally:
+            if old_opacity is not None: self.setWindowOpacity(old_opacity)
+            if panel_old_opacity is not None and self.ctrl_panel: self.ctrl_panel.setWindowOpacity(panel_old_opacity)
+            if msg_old_opacity is not None and self.msg_panel: self.msg_panel.setWindowOpacity(msg_old_opacity)
+            from PySide6.QtGui import QGuiApplication; QGuiApplication.processEvents()
+
+        if OST_PREPROCESS:
+            result = result.convert("L")
+            result = ImageEnhance.Brightness(result).enhance(1.12)
+            result = ImageEnhance.Contrast(result).enhance(1.32)
+            result = ImageEnhance.Sharpness(result).enhance(1.1)
+
+        if OST_SAVE_CAPTURE or DEBUG:
+            os.makedirs("captures", exist_ok=True)
+            result.save(os.path.join("captures", "last_main.png"), "PNG")
+
+        buf = io.BytesIO(); result.save(buf, format="PNG"); return buf.getvalue()
+
+# 置換：以降で使われる Overlay をラッソ対応版に差し替える
+Overlay = _LassoOverlay
+# ===== /LASSO INTEGRATION APPENDIX =====
+
 if __name__ == "__main__":
     main()
+
+
+# ===== FRONTMOST ENFORCER APPENDIX =====
+from PySide6.QtCore import QTimer
+import sys
+if sys.platform == "win32":
+    import ctypes
+    _SetWindowPos = ctypes.windll.user32.SetWindowPos
+    _HWND_TOPMOST = -1
+    _SWP_NOSIZE = 0x0001
+    _SWP_NOMOVE = 0x0002
+    _SWP_NOACTIVATE = 0x0010
+    _SWP_SHOWWINDOW = 0x0040
+
+def _force_topmost(widget):
+    try:
+        if widget is None: return
+        if not widget.isVisible(): return
+        if sys.platform == "win32":
+            hwnd = int(widget.winId())
+            _SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0, _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_SHOWWINDOW)
+        else:
+            # Non-Windows: reinforce flags & raise
+            flags = widget.windowFlags()
+            widget.setWindowFlags(flags | Qt.WindowStaysOnTopHint | Qt.Tool)
+            widget.show()
+            widget.raise_()
+    except Exception:
+        pass
+
+# Hook into Overlay (lasso版) to enforce topmost periodically and on key lifecycle points
+_old_init = _LassoOverlay.__init__
+def _init_frontmost(self, *a, **k):
+    _old_init(self, *a, **k)
+    try:
+        # 初期表示後・パネル作成後に強制
+        _force_topmost(self)
+        if hasattr(self, "ctrl_panel") and self.ctrl_panel:
+            _force_topmost(self.ctrl_panel)
+        if hasattr(self, "msg_panel") and self.msg_panel:
+            _force_topmost(self.msg_panel)
+        # 定期的に再適用（1.5秒ごと）
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.setInterval(1500)
+        self._topmost_timer.timeout.connect(lambda: (_force_topmost(self),
+                                                     _force_topmost(getattr(self, "ctrl_panel", None)),
+                                                     _force_topmost(getattr(self, "msg_panel", None))))
+        self._topmost_timer.start()
+    except Exception:
+        pass
+_LassoOverlay.__init__ = _init_frontmost
+
+# also reinforce on select-mode transitions
+_old_start_select_mode = _LassoOverlay.start_select_mode
+def _start_select_mode_front(self, *a, **k):
+    r = _old_start_select_mode(self, *a, **k)
+    _force_topmost(self); _force_topmost(getattr(self, "ctrl_panel", None)); _force_topmost(getattr(self, "msg_panel", None))
+    return r
+_LassoOverlay.start_select_mode = _start_select_mode_front
+
+_old_start_free = _LassoOverlay.start_free_select_mode
+def _start_free_front(self, *a, **k):
+    r = _old_start_free(self, *a, **k)
+    _force_topmost(self); _force_topmost(getattr(self, "ctrl_panel", None)); _force_topmost(getattr(self, "msg_panel", None))
+    return r
+_LassoOverlay.start_free_select_mode = _start_free_front
+
+# If reader window exists and is shown later, enforce there too
+def _maybe_force_reader(self):
+    try:
+        rd = getattr(self, "reader", None)
+        if rd and rd.isVisible():
+            _force_topmost(rd)
+    except Exception:
+        pass
+# piggyback on paintEvent to occasionally bring reader topmost
+_old_paint = _LassoOverlay.paintEvent
+def _paint_front(self, e):
+    _old_paint(self, e)
+    _maybe_force_reader(self)
+_LassoOverlay.paintEvent = _paint_front
+# ===== /FRONTMOST ENFORCER APPENDIX =====
